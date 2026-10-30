@@ -74,25 +74,34 @@ void ObStopWordChecker::destroy()
 int ObStopWordChecker::check_stopword(const ObFTWord &word, bool &is_stopword)
 {
   int ret = OB_SUCCESS;
-  
-  
+  // Declared up-front so the converted string stays valid for the whole lookup;
+  // constructing the arena does not allocate a page until it is first used.
   common::ObArenaAllocator allocator(lib::ObMemAttr("ChkStopWord"));
   if (OB_UNLIKELY(!inited_)) {
     ret = OB_NOT_INIT;
   } else if (OB_UNLIKELY(word.empty())) {
     ret = OB_INVALID_ARGUMENT;
   } else {
-    common::ObString cmp_str;
-    // do nothing set out with in if type is the same.
-    if (OB_FAIL(common::ObCharset::charset_convert(
-                                       allocator,
-                                       word.get_word().get_string(),
-                                       word.get_collation_type(),
-                                       stopword_type_.get_collation_type(),
-                                       cmp_str))) {
-    } else {
-      ObFTWord converted(cmp_str.length(), cmp_str.ptr(), stopword_type_);
-      ret = stopword_set_.exist_refactored(converted);
+    const ObFTWord *lookup_word = &word;
+    ObFTWord converted;
+    if (word.get_collation_type() != stopword_type_.get_collation_type()) {
+      common::ObString cmp_str;
+      if (OB_FAIL(common::ObCharset::charset_convert(
+                                         allocator,
+                                         word.get_word().get_string(),
+                                         word.get_collation_type(),
+                                         stopword_type_.get_collation_type(),
+                                         cmp_str))) {
+      } else {
+        converted = ObFTWord(cmp_str.length(), cmp_str.ptr(), stopword_type_);
+        lookup_word = &converted;
+      }
+    }
+    // When the word already uses the stopword table's collation, charset_convert is
+    // an identity transform, so we look the word up directly and skip the conversion
+    // and its arena page allocation entirely.
+    if (OB_SUCC(ret)) {
+      ret = stopword_set_.exist_refactored(*lookup_word);
       if (OB_HASH_NOT_EXIST == ret) {
         is_stopword = false;
         ret = OB_SUCCESS;
@@ -164,15 +173,33 @@ int ObAddWord::casedown_word(const ObFTWord &src, ObFTWord &dst)
   if (OB_UNLIKELY(src.empty())) {
     ret = OB_INVALID_ARGUMENT;
   } else if (flag_.casedown()) {
-    ObString dst_str;
-    if (OB_FAIL(ObCharset::tolower(
-                    word_meta_.get_collation_type(),
-                    src.get_word().get_string(),
-                    dst_str,
-                    allocator_))) {
+    // Fast path: a string made purely of ASCII bytes without any uppercase letter
+    // is unaffected by case folding under every collation.  Reuse the source string
+    // directly instead of paying one tolower + one allocator copy per token.
+    const ObString &src_str = src.get_word().get_string();
+    bool is_identity = true;
+    const char *ptr = src_str.ptr();
+    const int64_t len = src_str.length();
+    for (int64_t i = 0; i < len; ++i) {
+      const unsigned char c = static_cast<unsigned char>(ptr[i]);
+      if (c >= 0x80 || ('A' <= c && c <= 'Z')) {
+        is_identity = false;
+        break;
+      }
+    }
+    if (is_identity) {
+      dst = src;
     } else {
-      ObFTWord tmp(dst_str.length(), dst_str.ptr(), word_meta_);
-      dst = tmp;
+      ObString dst_str;
+      if (OB_FAIL(ObCharset::tolower(
+                      word_meta_.get_collation_type(),
+                      src_str,
+                      dst_str,
+                      allocator_))) {
+      } else {
+        ObFTWord tmp(dst_str.length(), dst_str.ptr(), word_meta_);
+        dst = tmp;
+      }
     }
   } else {
     dst = src;
